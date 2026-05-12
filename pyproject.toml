@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-loop-lite"
+version = "0.1.0"
+description = "Small RPIVJ agent loop with stateless workers and file-based state."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "agent-loop-lite contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+litellm = ["litellm>=1.40"]
+
+[project.scripts]
+agent-lite = "agent_loop_lite.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_loop_lite"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
