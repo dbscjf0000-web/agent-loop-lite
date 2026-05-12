@@ -33,6 +33,10 @@ Restate the task in 3-7 concrete lines.
 - If a check fails, say whether the next cycle should revise the plan or reread the task.
 
 Rules:
+- Output the plan document as your text response. Your stdout IS the plan.md
+  saved by the loop. Do NOT use Write/Edit tools to create the file. Do NOT
+  describe writing the file (e.g. "Plan written to workspace/plan.md") —
+  emit the document content itself.
 - Do not create a separate rubric.
 - Do not use vague criteria like "works well" or "is robust".
 - Every success criterion must be observable.
@@ -64,6 +68,15 @@ Write workspace files as fenced code blocks. Each file block must start with:
 
 Safe relative paths are allowed. Do not use absolute paths or `..`.
 
+Rules:
+- Emit the file contents as fenced code blocks in your text response. Your
+  stdout is parsed for `# file:` headers — the loop saves each block to that
+  filename. Do NOT use Write/Edit tools to create the files. Do NOT describe
+  writing them — emit the blocks themselves.
+- Read tool may be used to inspect existing workspace files (e.g. large input
+  documents) before deciding what to emit, but the final response must be the
+  fenced blocks that overwrite/create files.
+
 Task:
 {task}
 
@@ -89,7 +102,10 @@ plan, and workspace snapshot. Tests passing is not enough if the output misses
 the user's task. Tests failing is not enough to demand rereading the task if
 the plan is still sound.
 
-Return JSON only:
+Return JSON only — emit the JSON object as your text response.
+Do NOT wrap the JSON in ```json … ``` fences. Do NOT use any tools.
+The loop parses your stdout directly as JSON.
+
 {{
   "passed": <boolean>,
   "better": <boolean>,
