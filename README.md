@@ -20,6 +20,8 @@ The design keeps the core ideas from the full agent-loop project:
 - best snapshot and rollback
 - detailed judge hints fed into the next plan
 - worker-specific model selection
+- optional staged Builder (parallel subtasks within sequential stages)
+  for large outputs — opt-in via `### stage` headers in `plan.md`
 
 ## Worker Layout
 
@@ -129,3 +131,29 @@ timeout_s = 30
 ## Redo Guidance
 - If an edge-case test fails, revise the implementation plan before rebuilding.
 ```
+
+## Staged Builder (optional)
+
+For large outputs (expected total > ~5,000 words or many independent files),
+the Planner can split the Implement phase into stages:
+
+```md
+## Stages
+### stage 1
+- subtask: polish manuscript.md (NMI format)
+- subtask: polish SI.md (NMI format)
+
+### stage 2
+- subtask: cross-check references across both files
+- subtask: verify cross-file consistency
+```
+
+- The loop parses `### stage N` headers and `- subtask: …` bullets.
+- Stages run **sequentially**; subtasks inside a stage run **in parallel**
+  via a `ThreadPoolExecutor`, each as an independent Builder call.
+- Subtasks must own disjoint output files — two subtasks in the same stage
+  must never overwrite the same file. The Critic relies on this.
+- The configured Builder model is used for every subtask; per-subtask model
+  override is deliberately not implemented to keep the scheduler small.
+- If `plan.md` contains **no** `### stage` headers, the legacy single-call
+  Builder path runs untouched.
