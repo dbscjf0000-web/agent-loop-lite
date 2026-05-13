@@ -97,6 +97,24 @@ Rules:
 - Read tool may be used to inspect existing workspace files (e.g. large input
   documents) before deciding what to emit, but the final response must be the
   fenced blocks that overwrite/create files.
+- Required block shape — every emitted file MUST follow this exact pattern:
+
+      ```<lang>
+      # file: <filename>
+      <full new content of the file>
+      ```
+
+  The triple-backtick fence is mandatory. A bare `# file: …` line that is not
+  inside a fenced block is silently dropped by the parser, so the file would
+  not actually be saved.
+- If no change is needed for a file, OMIT its `# file:` block entirely. Never
+  emit an empty fenced block, and never emit a `# file:` header with no
+  content under it.
+- Always emit the COMPLETE new file content (full document) inside the fenced
+  block. Partial diffs, "unchanged sections elided", or "<keep previous>"
+  placeholders are NOT supported — they will overwrite the file with that
+  literal text. If you would only change a small region, you must still emit
+  the full file with the small region updated.
 
 Task:
 {task}
