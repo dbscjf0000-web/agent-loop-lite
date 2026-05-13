@@ -4,57 +4,115 @@
 
 ```text
 R = Read       task, prior feedback, success criteria
-P = Plan       concrete next implementation plan
-I = Implement  write files into workspace/
-V = Validate   run deterministic checks from plan.md
-J = Judge      promote best, roll back regressions, decide stop/redo
+P = Plan       concrete next implementation plan + verify.sh
+I = Implement  workers edit workspace/ freely (tools, not stdout)
+V = Validate   run verify.sh (or plan.md commands) for objective gate
+J = Judge      promote best (git tag), roll back regressions (git reset), decide stop/redo
 ```
 
-The design keeps the core ideas from the full agent-loop project:
+## v2: Git-Backed Workspace + Capability Tiers
 
-- stateless workers
-- file-based state as the source of truth
-- RPIVJ checkpoints
-- verifier-driven pass/fail
-- judge-driven redo
-- best snapshot and rollback
-- detailed judge hints fed into the next plan
-- worker-specific model selection
-- optional staged Builder (parallel subtasks within sequential stages)
-  for large outputs — opt-in via `### stage` headers in `plan.md`
+The original (v1) design forced every worker to emit file contents through
+stdout as `# file: <path>` fenced blocks. That contract caused real
+failures: large files truncated to placeholders, partial edits unsupported,
+no rollback on the first cycle, and Planner/Critic blindfolded with no
+read access to the workspace.
+
+v2 fixes the root cause: **don't parse the agent's stdout — observe the
+filesystem.**
+
+```
+                      v1                          v2
+                    ──────                      ──────
+Workspace state     plain folder                git repo (auto-init)
+Change detection    parse `# file:` blocks      git diff + git status
+Rollback target     copy `best/` folder         git reset --hard <tag>
+Promote PASS        copy workspace → best/      git tag best-cycle-N
+Builder tools       forbidden                   full read/write/exec
+Planner tools       forbidden                   read-only (ls/grep/cat/git)
+Critic tools        forbidden                   read-only diagnostic
+verify              inlined heredoc in plan     separate verify.sh file
+Worker context      only prior hint string      state.json + git log + history
+```
+
+### Capability tiers
+
+```
+                  Read    Write   Bash     Output artifact
+                  ────    ─────   ────     ───────────────
+Planner           ✓       (only plan.md/verify.sh)         plan.md, verify.sh
+Builder           ✓       ✓       ✓                        any workspace file
+Critic            ✓       ✗ (auto-revert)  diagnostic     judge.json
+```
+
+If the Critic accidentally writes to workspace/, the loop detects the
+uncommitted change with `git status --porcelain` and `git reset --hard`s
+back to the Critic-pre snapshot.
+
+### Wipe protection
+
+The legacy `# file:` parser is still accepted as a fallback for CLIs
+without file-write tools (e.g. some mock setups), but **bodies that look
+like placeholders are rejected** before they overwrite a file:
+
+- `…(생략)…`, `<keep previous>`, `... elided ...`, `... unchanged ...`
+- Short bodies that consist only of an ellipsis
+
+This addresses the v1 sequence where a 49 KB manuscript was wiped to 1
+byte because the agent ran out of output tokens mid-emit and shipped
+`"...(전체는 워크스페이스와 동일)..."` as the "new contents."
 
 ## Worker Layout
 
 ```text
-Planner = R + P
-Builder = I
-Critic  = V + J
+Planner = R + P   →   plan.md + verify.sh
+Builder = I       →   workspace files (via tools)
+Critic  = V + J   →   judge.json
 ```
 
-Logical phases remain RPIVJ even though the implementation only has three
-workers.
+Logical phases stay RPIVJ even though the implementation has three workers.
 
 ## State Layout
 
 ```text
-.agent_loop/
+state/
 └─ <task-id>/
-   ├─ task.md
-   ├─ r.md
-   ├─ plan.md
-   ├─ build.md
-   ├─ check.json
-   ├─ judge.json
-   ├─ state.json
-   ├─ log.jsonl
-   ├─ metrics.jsonl
-   ├─ checkpoints/
-   └─ workspace/
-      ├─ ...
-      └─ best/
-         ├─ manifest.json
-         └─ ...
+   ├─ task.md          # user task (immutable)
+   ├─ r.md             # R notes (subset of plan)
+   ├─ plan.md          # current cycle's plan
+   ├─ build.md         # builder stdout log
+   ├─ check.json       # verifier result
+   ├─ judge.json       # critic verdict
+   ├─ state.json       # cross-cycle context (history, best_tag, hints)
+   ├─ log.jsonl        # append-only event timeline
+   ├─ metrics.jsonl    # token/cost/latency per phase
+   ├─ checkpoints/     # per-phase snapshots
+   └─ workspace/       # git repo
+      ├─ .git/
+      ├─ .gitignore
+      ├─ verify.sh     # written by Planner
+      └─ <files>       # written by Builder
 ```
+
+`state.json` carries the cross-cycle context that v1 lacked:
+
+```json
+{
+  "cycle": 3,
+  "best_tag": "best-cycle-002",
+  "last_pre_cycle_sha": "a3f...",
+  "previous_action": "redo_P",
+  "previous_hint": "abstract exceeded word limit",
+  "history": [
+    {"cycle": 1, "passed": false, "action": "redo_P", "hint": "verify shell-escape"},
+    {"cycle": 2, "passed": false, "action": "redo_P", "hint": "abstract too long"}
+  ]
+}
+```
+
+History is capped at the most recent 8 cycles and injected into every
+worker's prompt so they can learn from prior attempts without a stateful
+session.
 
 ## Quick Start
 
@@ -64,7 +122,7 @@ python -m agent_loop_lite.cli list
 python -m agent_loop_lite.cli resume <task-id>
 ```
 
-The default models are test-friendly:
+Default models are test-friendly:
 
 ```toml
 [models]
@@ -73,23 +131,13 @@ builder = "mock"
 critic = "rule"
 ```
 
-Planner writes a detailed plan with success criteria and verification strategy.
-Critic runs those checks, reads the workspace snapshot, and writes a detailed
-next-cycle hint when it does not stop.
-
-```text
-Planner: task.md + prior judge hint -> r.md + plan.md
-Builder: plan.md -> workspace/*
-Critic:  plan.md + workspace/* + check result -> check.json + judge.json
-```
-
-Override them per worker:
+Override per worker (use real CLIs):
 
 ```bash
 agent-lite run "task" \
-  --planner-model "litellm/openai/gpt-4o-mini" \
-  --builder-model "shell:my-builder-command" \
-  --critic-model "rule"
+  --planner-model "shell:codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -" \
+  --builder-model "shell:cursor-agent -p --force --model composer-2" \
+  --critic-model  "shell:claude -p --dangerously-skip-permissions --model opus"
 ```
 
 Supported model strings:
@@ -103,9 +151,10 @@ Supported model strings:
 ## Config
 
 ```toml
-root = ".agent_loop"
+root = "state"
 max_cycles = 3
 max_redo = 2
+model_timeout_s = 600
 
 [models]
 planner = "mock"
@@ -118,24 +167,51 @@ command = ""       # used when mode = shell
 timeout_s = 30
 ```
 
-`plan.md` is the contract:
+## Verification contract
 
-```md
-## Success Criteria
-- [ ] criterion: empty input returns an empty list
-  verify: `pytest tests/test_processor.py::test_empty_input -q`
+In `mode = "plan"` the loop runs `bash verify.sh` (or `python3 verify.py`)
+**automatically** if Planner produced one. This is the v2 contract — the
+Planner ships a real script, not a heredoc inlined in plan.md, so:
 
-## Verification Strategy
-1. Run `pytest tests/test_processor.py -q`
+- Re-runnable manually for debugging
+- No shell escaping bugs
+- Same gate every cycle until Planner updates the script
 
-## Redo Guidance
-- If an edge-case test fails, revise the implementation plan before rebuilding.
+`plan.md` retains a `## Verification Strategy` section for humans, but the
+script is the source of truth.
+
+Example `verify.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -f fib.py ]] || { echo "FAIL: missing fib.py" >&2; exit 1; }
+out=$(python3 fib.py)
+[[ "$out" == *55* ]] || { echo "FAIL: expected '55' in stdout" >&2; exit 1; }
+echo PASS
 ```
+
+## Promote / Rollback
+
+```text
+PASS → git tag best-cycle-N (force-updated)
+       state.best_tag = "best-cycle-N"
+       redo_count = 0
+
+FAIL → git reset --hard <state.best_tag>
+       (falls back to best-cycle-0 = pre-task snapshot)
+       redo_count += 1
+       loop until max_redo or stop
+```
+
+PASS-only promotion (v2 policy): a failing cycle is never tagged "best."
+This is intentionally simpler than v1's `better=true` heuristic; the cost
+of a rare "fail-but-improving" case is small compared to the bookkeeping.
 
 ## Staged Builder (optional)
 
-For large outputs (expected total > ~5,000 words or many independent files),
-the Planner can split the Implement phase into stages:
+For large outputs (~5,000+ words or many independent files), the Planner
+can split the Implement phase into stages:
 
 ```md
 ## Stages
@@ -148,12 +224,42 @@ the Planner can split the Implement phase into stages:
 - subtask: verify cross-file consistency
 ```
 
-- The loop parses `### stage N` headers and `- subtask: …` bullets.
-- Stages run **sequentially**; subtasks inside a stage run **in parallel**
-  via a `ThreadPoolExecutor`, each as an independent Builder call.
-- Subtasks must own disjoint output files — two subtasks in the same stage
-  must never overwrite the same file. The Critic relies on this.
-- The configured Builder model is used for every subtask; per-subtask model
-  override is deliberately not implemented to keep the scheduler small.
-- If `plan.md` contains **no** `### stage` headers, the legacy single-call
-  Builder path runs untouched.
+- `### stage N` headers and `- subtask: …` bullets are parsed.
+- Stages run **sequentially**.
+- Subtasks within one stage run in parallel via a `ThreadPoolExecutor`,
+  capped at `min(N, 4)` workers.
+- Subtasks must own disjoint output files — two subtasks in the same
+  stage must never overwrite the same file.
+- If `plan.md` has no `### stage` headers, a single Builder call runs.
+
+## What carries across cycles
+
+| File / artifact            | Type        | Used by next cycle? |
+|----------------------------|-------------|---------------------|
+| `task.md`                  | immutable   | yes (always)        |
+| `state.json` (history)     | accumulated | yes (history window)|
+| `state.json` (best_tag)    | overwritten | yes (rollback target)|
+| `log.jsonl`, `metrics.jsonl` | append-only | not in prompt, sits on disk for audit |
+| `plan.md`, `judge.json`    | overwritten | yes (last cycle only)|
+| `workspace/` (git log)     | accumulated | yes (recent commits in prompt) |
+
+Workers are stateless processes (a fresh CLI subprocess every call), but
+they receive enough cross-cycle context via `state.json` + recent
+`git log` + `history` to behave as if stateful.
+
+## Smoke test
+
+```bash
+agent-lite run "Create fib.py that prints the first 10 Fibonacci numbers. \
+  Provide a verify.sh that runs the script and asserts '55' appears in stdout." \
+  --task-id fib --cycles 2
+```
+
+Expected: one cycle, `check.json` shows `bash verify.sh` returncode 0,
+`judge.json` action `stop`, and the workspace has a clean `git log` like:
+
+```
+cycle-001-I builder      (fib.py)
+planner-cycle            (verify.sh)
+init                     (.gitignore)
+```

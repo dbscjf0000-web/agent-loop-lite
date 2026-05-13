@@ -38,9 +38,17 @@ def validate_workspace(
             commands=[],
         )
     if mode == "plan":
+        # v2: prefer a real verify.sh / verify.py file in workspace over
+        # commands inlined in plan.md. This is the contract that lets the
+        # Planner ship a separate, debuggable, re-runnable script.
+        for script in ("verify.sh", "verify.py"):
+            script_path = workspace / script
+            if script_path.is_file():
+                runner = "bash" if script.endswith(".sh") else "python3"
+                return _run_commands(workspace, [f"{runner} {script}"], config.timeout_s, "plan")
         commands = extract_verification_commands(plan_text)
         if not commands:
-            files = [p for p in workspace.iterdir() if p.name != "best"]
+            files = [p for p in workspace.iterdir() if p.name not in {"best", ".git"}]
             passed = any(p.is_file() or p.is_dir() for p in files)
             return CheckResult(
                 passed=passed,

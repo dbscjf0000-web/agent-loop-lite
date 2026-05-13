@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from agent_loop_lite import git_ops
 from agent_loop_lite.config import Config
 from agent_loop_lite.model import ModelResponse
-from concurrent.futures import ThreadPoolExecutor
 from agent_loop_lite.phases import parse_stages, run_builder, run_critic, run_planner
 from agent_loop_lite.state import TaskDir
+
+_HISTORY_MAX = 8
+_MAX_BUILDER_WORKERS = 4
 
 
 @dataclass(frozen=True)
@@ -31,7 +35,20 @@ class LoopRunner:
         if task is not None and not self.task_dir.task_path().read_text(encoding="utf-8").strip():
             self.task_dir.task_path().write_text(task, encoding="utf-8")
 
+        # Ensure workspace is a git repo; commit any seeded files as the
+        # initial "best-cycle-0" baseline.
+        workspace = self.task_dir.workspace_path()
+        git_ops.ensure_repo(workspace)
+        if git_ops.has_uncommitted_changes(workspace):
+            git_ops.commit_all(workspace, "seed")
+        if not git_ops.tag_exists(workspace, "best-cycle-0"):
+            git_ops.tag(workspace, "best-cycle-0")
+
         state = self.task_dir.load_state()
+        if "best_tag" not in state:
+            state["best_tag"] = "best-cycle-0"
+            self.task_dir.save_state(state)
+
         cycle = int(state.get("cycle", 1))
         status = "running"
 
@@ -40,6 +57,10 @@ class LoopRunner:
             self.task_dir.append_log("cycle_start", cycle=cycle, phase=next_phase)
 
             if next_phase in {"R", "P"}:
+                pre_sha = git_ops.current_sha(workspace)
+                state["last_pre_cycle_sha"] = pre_sha
+                self.task_dir.save_state(state)
+
                 planner = run_planner(self.task_dir, self.config)
                 if next_phase == "R":
                     self._checkpoint("R", cycle, planner.response)
@@ -51,7 +72,6 @@ class LoopRunner:
                 plan_text = self.task_dir.read_text("plan.md", "")
                 stages = parse_stages(plan_text)
                 if stages:
-                    # Clear build.md so subtasks append cleanly
                     self.task_dir.write_text("build.md", "")
                     all_changed: list[str] = []
                     last_resp = None
@@ -59,7 +79,8 @@ class LoopRunner:
                         self.task_dir.append_log(
                             "stage_start", cycle=cycle, stage=stage_idx, subtasks=len(subtasks),
                         )
-                        with ThreadPoolExecutor(max_workers=max(1, len(subtasks))) as ex:
+                        workers = min(max(1, len(subtasks)), _MAX_BUILDER_WORKERS)
+                        with ThreadPoolExecutor(max_workers=workers) as ex:
                             futures = [
                                 ex.submit(run_builder, self.task_dir, self.config,
                                           subtask_context=s)
@@ -82,6 +103,11 @@ class LoopRunner:
                         "I", cycle, builder.response,
                         {"changed_files": builder.changed_files},
                     )
+
+                # Commit Builder's output so the V/J phase can diff against
+                # pre-cycle baseline.
+                if git_ops.has_uncommitted_changes(workspace):
+                    git_ops.commit_all(workspace, f"cycle-{cycle:03d}-I builder")
                 state = self._save_progress(state, cycle=cycle, next_phase="V")
                 next_phase = "V"
 
@@ -108,7 +134,7 @@ class LoopRunner:
             task_id=self.task_dir.task_id,
             status=status,
             cycles_run=int(state.get("cycle", cycle)),
-            best_exists=bool(state.get("best_exists", False)),
+            best_exists=bool(state.get("best_tag") and state["best_tag"] != "best-cycle-0"),
         )
 
     def _checkpoint(
@@ -144,37 +170,62 @@ class LoopRunner:
         self.task_dir.save_state(updated)
         return updated
 
+    def _append_history(self, state: dict[str, Any], entry: dict[str, Any]) -> None:
+        history = list(state.get("history") or [])
+        history.append(entry)
+        if len(history) > _HISTORY_MAX:
+            history = history[-_HISTORY_MAX:]
+        state["history"] = history
+
     def _handle_judge(
         self,
         state: dict[str, Any],
         cycle: int,
         judge: dict[str, Any],
     ) -> tuple[dict[str, Any], str]:
+        workspace = self.task_dir.workspace_path()
         passed = bool(judge.get("passed", False))
-        better = bool(judge.get("better"))
         action = str(judge.get("action", "stop"))
         redo_count = int(state.get("redo_count", 0))
 
-        if better:
-            self.task_dir.snapshot_best(cycle=cycle)
+        # Capability tier 단순화: PASS만 promote (코덱스 권고).
+        # FAIL은 무조건 best-cycle-(N-1)로 리셋.
+        if passed:
+            tag_name = f"best-cycle-{cycle:03d}"
+            git_ops.tag(workspace, tag_name)
+            state["best_tag"] = tag_name
             state["best_exists"] = True
             redo_count = 0
-            self.task_dir.append_log("promote_best", cycle=cycle, passed=passed)
+            self.task_dir.append_log("promote_best", cycle=cycle, tag=tag_name)
         else:
-            restored = self.task_dir.restore_best()
+            best_tag = str(state.get("best_tag") or "best-cycle-0")
+            try:
+                git_ops.reset_hard(workspace, best_tag)
+                restored = True
+            except Exception:
+                restored = False
             redo_count += 1
             self.task_dir.append_log(
                 "rollback",
                 cycle=cycle,
-                passed=passed,
+                action=action,
                 restored=restored,
+                target=best_tag,
             )
+
+        self._append_history(state, {
+            "cycle": cycle,
+            "passed": passed,
+            "action": action,
+            "hint": str(judge.get("hint") or "")[:300],
+        })
+        state["previous_action"] = action
+        state["previous_hint"] = str(judge.get("hint") or "")[:300]
 
         self.task_dir.append_log(
             "judge",
             cycle=cycle,
             passed=passed,
-            better=better,
             action=action,
             redo_count=redo_count,
         )

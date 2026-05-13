@@ -18,7 +18,10 @@ def test_mock_loop_writes_rpivj_artifacts_and_best(tmp_path):
     assert (td.path / "check.json").exists()
     assert (td.path / "judge.json").exists()
     assert (td.workspace_path() / "solution.py").exists()
-    assert (td.workspace_path() / "best" / "solution.py").exists()
+    # v2: best snapshot is a git tag, not a `best/` folder.
+    from agent_loop_lite import git_ops
+    assert git_ops.is_repo(td.workspace_path())
+    assert git_ops.tag_exists(td.workspace_path(), "best-cycle-001")
 
     for phase in ("R", "P", "I", "V", "J"):
         assert (td.checkpoint_dir() / f"cycle_001_phase_{phase}.json").exists()
