@@ -52,10 +52,17 @@ def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
     return PlannerOutput(r_notes=r_notes, plan=plan, response=resp)
 
 
-def run_builder(task_dir: TaskDir, config: Config) -> BuilderOutput:
+def run_builder(
+    task_dir: TaskDir,
+    config: Config,
+    *,
+    subtask_context: str | None = None,
+) -> BuilderOutput:
     task = task_dir.task_path().read_text(encoding="utf-8")
     r_notes = task_dir.read_text("r.md", "(no R notes)")
     plan = task_dir.read_text("plan.md", "(no plan)")
+    if subtask_context:
+        plan = plan + "\n\n## Current subtask\n" + subtask_context + "\n"
     prompt = BUILDER_PROMPT.format(
         task=task,
         r_notes=r_notes,
@@ -81,8 +88,39 @@ def run_builder(task_dir: TaskDir, config: Config) -> BuilderOutput:
     build_log = _strip_fences(resp.text).strip()
     if changed:
         build_log += f"\n\nchanged_files: {', '.join(sorted(changed))}"
-    task_dir.write_text("build.md", build_log.strip() + "\n")
+    if subtask_context:
+        first_line = subtask_context.strip().splitlines()[0] if subtask_context.strip() else "subtask"
+        existing = task_dir.read_text("build.md", "")
+        task_dir.write_text(
+            "build.md",
+            (existing.rstrip("\n") + ("\n\n" if existing.strip() else "")
+             + f"### subtask: {first_line}\n" + build_log.strip() + "\n"),
+        )
+    else:
+        task_dir.write_text("build.md", build_log.strip() + "\n")
     return BuilderOutput(changed_files=sorted(changed), response=resp)
+
+
+_STAGE_RE = re.compile(r"^###\s+stage\s+(\d+)\b", re.IGNORECASE | re.MULTILINE)
+_SUBTASK_RE = re.compile(r"^[-*]\s*subtask\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_stages(plan_text: str) -> list[list[str]]:
+    """Return stages, each a list of subtask one-liners.
+
+    Returns ``[]`` when the plan has no ``### stage`` headers — caller should
+    fall back to a single ``run_builder`` call.
+    """
+    starts = [(m.start(), int(m.group(1))) for m in _STAGE_RE.finditer(plan_text)]
+    if not starts:
+        return []
+    boundaries = [s for s, _ in starts] + [len(plan_text)]
+    stages: list[list[str]] = []
+    for i in range(len(starts)):
+        section = plan_text[boundaries[i]:boundaries[i + 1]]
+        subtasks = [m.group(1).strip() for m in _SUBTASK_RE.finditer(section)]
+        stages.append(subtasks)
+    return [s for s in stages if s]
 
 
 def run_critic(task_dir: TaskDir, config: Config) -> CriticOutput:

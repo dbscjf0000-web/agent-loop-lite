@@ -46,6 +46,27 @@ Rules:
   and do not repeat the failed approach unless you explain why it is still valid.
 - If prior feedback says verification was missing, update Success Criteria and
   Verification Strategy.
+- For large outputs (expected total > 5000 words, or multiple independent
+  files), split into `### stage N` groups. Each stage runs after the previous
+  finishes; subtasks within one stage are dispatched in parallel and must be
+  fully independent (no shared file regions, no state across subtasks).
+  When stages are not needed (small task, single output), do NOT emit stage
+  headers — the loop falls back to a single Builder call.
+
+Stage format (when used) — append after "Implementation Steps":
+
+## Stages
+### stage 1
+- subtask: <one-line goal>
+- subtask: <one-line goal>
+
+### stage 2
+- subtask: <one-line goal>
+
+The Builder is called once per subtask with that bullet appended to the
+prompt. Each subtask must produce its own `# file:` blocks that overwrite
+the workspace files it owns. Two subtasks must never overwrite the same
+file in the same stage.
 
 Task:
 {task}

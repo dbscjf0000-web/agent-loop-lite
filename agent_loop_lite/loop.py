@@ -5,7 +5,8 @@ from typing import Any
 
 from agent_loop_lite.config import Config
 from agent_loop_lite.model import ModelResponse
-from agent_loop_lite.phases import run_builder, run_critic, run_planner
+from concurrent.futures import ThreadPoolExecutor
+from agent_loop_lite.phases import parse_stages, run_builder, run_critic, run_planner
 from agent_loop_lite.state import TaskDir
 
 
@@ -47,13 +48,40 @@ class LoopRunner:
                 next_phase = "I"
 
             if next_phase == "I":
-                builder = run_builder(self.task_dir, self.config)
-                self._checkpoint(
-                    "I",
-                    cycle,
-                    builder.response,
-                    {"changed_files": builder.changed_files},
-                )
+                plan_text = self.task_dir.read_text("plan.md", "")
+                stages = parse_stages(plan_text)
+                if stages:
+                    # Clear build.md so subtasks append cleanly
+                    self.task_dir.write_text("build.md", "")
+                    all_changed: list[str] = []
+                    last_resp = None
+                    for stage_idx, subtasks in enumerate(stages, start=1):
+                        self.task_dir.append_log(
+                            "stage_start", cycle=cycle, stage=stage_idx, subtasks=len(subtasks),
+                        )
+                        with ThreadPoolExecutor(max_workers=max(1, len(subtasks))) as ex:
+                            futures = [
+                                ex.submit(run_builder, self.task_dir, self.config,
+                                          subtask_context=s)
+                                for s in subtasks
+                            ]
+                            for fut in futures:
+                                out = fut.result()
+                                all_changed.extend(out.changed_files)
+                                last_resp = out.response
+                        self.task_dir.append_log("stage_end", cycle=cycle, stage=stage_idx)
+                    if last_resp is not None:
+                        self._checkpoint(
+                            "I", cycle, last_resp,
+                            {"changed_files": sorted(set(all_changed)),
+                             "stages": len(stages)},
+                        )
+                else:
+                    builder = run_builder(self.task_dir, self.config)
+                    self._checkpoint(
+                        "I", cycle, builder.response,
+                        {"changed_files": builder.changed_files},
+                    )
                 state = self._save_progress(state, cycle=cycle, next_phase="V")
                 next_phase = "V"
 
