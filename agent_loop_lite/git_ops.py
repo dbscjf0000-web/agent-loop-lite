@@ -144,6 +144,18 @@ def reset_hard(workspace: Path, ref: str) -> None:
     _run(workspace, "clean", "-fdq")
 
 
+def checkout_file(workspace: Path, ref: str, path: str) -> None:
+    """Restore a single file to its content at ref."""
+    _run(workspace, "checkout", ref, "--", path)
+
+
+def remove_untracked(workspace: Path, path: str) -> None:
+    """Remove an untracked file from the workspace."""
+    target = workspace / path
+    if target.exists():
+        target.unlink()
+
+
 def list_tags(workspace: Path, pattern: str = "*") -> list[str]:
     try:
         res = _run(workspace, "tag", "-l", pattern)

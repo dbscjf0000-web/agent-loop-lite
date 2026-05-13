@@ -62,9 +62,89 @@ def _state_context(task_dir: TaskDir) -> dict[str, str]:
     }
 
 
-def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
+_PLAN_SCHEMA_REQUIRED = ("Task Summary", "Success Criteria", "Implementation Steps")
+_CHECKBOX_RE = re.compile(r"^\s*-\s*\[\s?\]", re.MULTILINE)
+# v2.2: files Planner is allowed to add or modify in workspace/. Anything
+# else found in `git status --porcelain` after a Planner call is reverted
+# (overstepping the read-only tier). plan.md / r.md are lifted to state/
+# before this check runs, so they should not appear in workspace status.
+PLANNER_ALLOWLIST = frozenset({"verify.sh", "verify.py", ".gitignore"})
+
+
+def _enforce_planner_allowlist(
+    workspace: Path,
+    pre_sha: str | None,
+    task_dir: TaskDir,
+    cycle: int,
+) -> list[str]:
+    """Revert workspace files Planner wrote outside the allowlist.
+
+    Returns the list of violation paths (after revert). Empty list = clean.
+    """
+    if not git_ops.is_repo(workspace):
+        return []
+    violations: list[tuple[str, str]] = []
+    for raw in git_ops.status_porcelain(workspace).splitlines():
+        if not raw.strip():
+            continue
+        code = raw[:2]
+        path = raw[3:].strip()
+        if not path:
+            continue
+        if path in PLANNER_ALLOWLIST or path.startswith(".git/"):
+            continue
+        violations.append((path, code))
+    for path, code in violations:
+        try:
+            if "?" in code:
+                # Untracked file the Planner created → remove it
+                git_ops.remove_untracked(workspace, path)
+            elif pre_sha:
+                # Modified tracked file → restore from pre-cycle snapshot
+                git_ops.checkout_file(workspace, pre_sha, path)
+            else:
+                # No pre-cycle ref to fall back on; force-restore from HEAD
+                git_ops.checkout_file(workspace, "HEAD", path)
+        except Exception:
+            pass
+    if violations:
+        task_dir.append_log(
+            "planner_tier_violation",
+            cycle=cycle,
+            files=[p for p, _ in violations],
+        )
+    return [p for p, _ in violations]
+
+
+def validate_plan_schema(plan_text: str) -> list[str]:
+    """Return list of schema violations. Empty list = valid plan."""
+    issues: list[str] = []
+    for heading in _PLAN_SCHEMA_REQUIRED:
+        section = _markdown_section(plan_text, heading)
+        if not section.strip():
+            issues.append(f"missing or empty section: ## {heading}")
+            continue
+        body = section.split("\n", 1)[1] if "\n" in section else ""
+        if heading == "Success Criteria":
+            if not _CHECKBOX_RE.search(body):
+                issues.append("## Success Criteria has no `- [ ]` checkbox items")
+        elif heading == "Implementation Steps":
+            if not re.search(r"^\s*(?:\d+\.|[-*])\s+\S", body, re.MULTILINE):
+                issues.append("## Implementation Steps has no numbered/bulleted items")
+    return issues
+
+
+def _call_planner_once(
+    task_dir: TaskDir,
+    config: Config,
+    *,
+    extra_feedback: str = "",
+) -> tuple[ModelResponse, str]:
+    """Single Planner call. Returns (response, plan_text_after_extraction)."""
     task = task_dir.task_path().read_text(encoding="utf-8")
     feedback = _previous_feedback(task_dir)
+    if extra_feedback:
+        feedback = (feedback + "\n\n" if feedback != "(none)" else "") + extra_feedback
     ctx = _state_context(task_dir)
     prompt = PLANNER_PROMPT.format(
         task=task,
@@ -74,7 +154,6 @@ def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
         changed_files=ctx["changed_files"],
     )
     workspace = task_dir.workspace_path()
-    pre_sha = git_ops.current_sha(workspace) if git_ops.is_repo(workspace) else None
     resp = call_model(
         "planner",
         prompt,
@@ -84,7 +163,7 @@ def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
     )
 
     # Planner may write files via tools (cwd=workspace) OR emit `# file:`
-    # blocks in stdout. Resolve all three channels:
+    # blocks in stdout. Resolve channels:
     # 1) tool-written verify.sh/verify.py stays in workspace (run target).
     # 2) tool-written plan.md/r.md inside workspace → move to state dir.
     # 3) `# file:` blocks in stdout → write where appropriate.
@@ -97,34 +176,86 @@ def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
             if name.endswith(".sh"):
                 path.chmod(0o755)
 
-    # If the worker wrote plan.md to workspace via tools, lift it out so the
-    # rest of the loop (which reads state_dir/plan.md) sees it.
+    # If the worker wrote plan.md / r.md to workspace via tools, capture
+    # the contents and remove from workspace.
     ws_plan = workspace / "plan.md"
+    tool_plan: str | None = None
     if ws_plan.exists():
-        task_dir.write_text("plan.md", ws_plan.read_text(encoding="utf-8"))
+        tool_plan = ws_plan.read_text(encoding="utf-8")
         ws_plan.unlink()
     ws_r = workspace / "r.md"
     if ws_r.exists():
+        # r.md is auto-derived later; just lift if the worker wrote one.
         task_dir.write_text("r.md", ws_r.read_text(encoding="utf-8"))
         ws_r.unlink()
 
-    # plan_text: prefer stdout content when present; otherwise read plan.md if
-    # the worker wrote it via tools (now lifted into state dir).
     cleaned = _strip_file_blocks(resp.text)
-    if cleaned.strip():
+    # v2.1: prefer the tool-written plan.md when it's substantive. Codex/
+    # claude often write a real plan via the Write tool AND emit a one-line
+    # status report on stdout — without this preference, the status report
+    # would clobber the actual plan.
+    if tool_plan and len(tool_plan.strip()) > 200:
+        plan_text = tool_plan
+    elif cleaned.strip():
         plan_text = cleaned
     else:
-        plan_text = task_dir.read_text("plan.md", "")
+        plan_text = tool_plan or task_dir.read_text("plan.md", "")
+    return resp, plan_text
+
+
+def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
+    workspace = task_dir.workspace_path()
+    pre_sha = git_ops.current_sha(workspace) if git_ops.is_repo(workspace) else None
+    cycle = int(task_dir.load_state().get("cycle", 0))
+    resp, plan_text = _call_planner_once(task_dir, config)
+
+    # v2.1: schema validation. If the Planner skipped required sections,
+    # retry once with an explicit complaint. This catches "status-report"
+    # plans where the Planner ignored the template (role confusion noted
+    # by both Codex and Gemini reviews).
+    plan_normalized = _normalize_plan(plan_text)
+    issues = validate_plan_schema(plan_normalized)
+    if issues:
+        task_dir.append_log(
+            "plan_schema_violation",
+            cycle=int(task_dir.load_state().get("cycle", 0)),
+            issues=issues,
+            attempt=1,
+        )
+        complaint = (
+            "Your previous plan.md FAILED schema validation:\n"
+            + "\n".join(f"- {x}" for x in issues)
+            + "\n\nThe plan MUST follow the template exactly: a `# Plan` heading "
+            "with `## Task Summary` (3-7 lines), `## Success Criteria` (with at "
+            "least one `- [ ]` checkbox), and `## Implementation Steps` (numbered "
+            "or bulleted concrete steps). Do not emit a status report. Write the "
+            "actual plan."
+        )
+        resp, plan_text = _call_planner_once(task_dir, config, extra_feedback=complaint)
+        plan_normalized = _normalize_plan(plan_text)
+        issues2 = validate_plan_schema(plan_normalized)
+        if issues2:
+            task_dir.append_log(
+                "plan_schema_violation",
+                cycle=int(task_dir.load_state().get("cycle", 0)),
+                issues=issues2,
+                attempt=2,
+            )
 
     r_notes, plan = _split_planner_response(plan_text)
     task_dir.write_text("r.md", r_notes)
     task_dir.write_text("plan.md", plan)
 
-    # Snapshot Planner's writes (plan.md/verify.sh/r.md may be inside workspace
-    # too if the worker put them there). Commit so Builder starts from a clean
-    # baseline.
+    # v2.2: enforce Planner capability tier. Any workspace file Planner
+    # touched outside the allowlist (verify.sh, verify.py, .gitignore) is
+    # reverted to pre-cycle state. Both Codex and Gemini reviews
+    # ("capability escape" / "Agency Leakage") flagged this as the most
+    # important fix: enforce boundaries with the environment, not just the
+    # prompt.
+    _enforce_planner_allowlist(workspace, pre_sha, task_dir, cycle)
+
     if git_ops.is_repo(workspace) and git_ops.has_uncommitted_changes(workspace):
-        git_ops.commit_all(workspace, f"planner-cycle")
+        git_ops.commit_all(workspace, "planner-cycle")
     return PlannerOutput(r_notes=r_notes, plan=plan, response=resp)
 
 
