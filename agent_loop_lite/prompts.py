@@ -146,6 +146,19 @@ NOT blockers (do not flag these):
 - "Could be improved" suggestions.
 - Anything that requires running additional experiments.
 
+Framework context — DO NOT flag these as violations:
+- ``verify.sh`` / ``verify.py`` are system-required Planner deliverables.
+  The loop calls them automatically every cycle.
+- ``plan.md`` / ``r.md`` are system-managed planning artifacts (the
+  orchestrator lifts them out of workspace into the task state directory).
+- ``.gitignore`` and ``.git/`` are workspace-repo infrastructure.
+
+These are framework-required outputs, NOT "extra helper files," even when
+the task description says it wants a single user-facing deliverable. Only
+flag them if the task EXPLICITLY bans orchestration files (e.g. "do not
+write verify.sh"). When in doubt, treat them as expected and look for
+real defects in the user-facing deliverable instead.
+
 You MAY use read-only tools (Read, Glob, Grep, Bash) to inspect the
 workspace, run verify scripts, or grep for patterns.
 You MUST NOT modify any file. Output JSON only — no prose, no fences.
