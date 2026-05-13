@@ -52,6 +52,10 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--critic-model", default=None)
     parser.add_argument("--verify-mode", choices=["none", "plan", "pytest", "shell"], default=None)
     parser.add_argument("--verify-command", default=None)
+    parser.add_argument("--stop-gate-model", default=None,
+                        help="Enable Stop-Gate and use this model for it.")
+    parser.add_argument("--no-stop-gate", action="store_true",
+                        help="Disable Stop-Gate even if config enables it.")
 
 
 def _config_from_args(args: argparse.Namespace):
@@ -65,6 +69,8 @@ def _config_from_args(args: argparse.Namespace):
         critic_model=args.critic_model,
         verify_mode=args.verify_mode,
         verify_command=args.verify_command,
+        stop_gate_model=args.stop_gate_model,
+        stop_gate_disable=args.no_stop_gate,
     )
 
 

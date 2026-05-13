@@ -10,7 +10,12 @@ from agent_loop_lite import git_ops
 from agent_loop_lite.config import Config
 from agent_loop_lite.jsonutil import extract_json
 from agent_loop_lite.model import ModelResponse, call_model
-from agent_loop_lite.prompts import BUILDER_PROMPT, CRITIC_PROMPT, PLANNER_PROMPT
+from agent_loop_lite.prompts import (
+    BUILDER_PROMPT,
+    CRITIC_PROMPT,
+    PLANNER_PROMPT,
+    STOP_GATE_PROMPT,
+)
 from agent_loop_lite.state import TaskDir
 from agent_loop_lite.verifier import CheckResult, validate_workspace
 
@@ -403,6 +408,141 @@ def run_critic(task_dir: TaskDir, config: Config) -> CriticOutput:
     judge = _normalize_judge(parsed, check)
     task_dir.write_json("judge.json", judge)
     return CriticOutput(check=check, judge=judge, response=resp)
+
+
+_VENDOR_KEYWORDS = (
+    ("claude", "anthropic"),
+    ("codex", "openai"),
+    ("gemini", "google"),
+    ("cursor", "cursor"),
+)
+
+
+def _detect_vendor(model_spec: str) -> str | None:
+    """Best-effort vendor detection from a model spec string."""
+    if not model_spec:
+        return None
+    s = model_spec.lower()
+    for key, vendor in _VENDOR_KEYWORDS:
+        if key in s:
+            return vendor
+    return None
+
+
+def resolve_stop_gate_model(config: Config) -> str:
+    """Pick the model for the Stop-Gate check.
+
+    Priority:
+      1. ``config.stop_gate.model`` if set.
+      2. Auto vendor mapping based on the main critic when ``auto`` is true.
+      3. Empty string → caller should skip the gate.
+    """
+    sg = config.stop_gate
+    if sg.model:
+        return sg.model
+    if not sg.auto:
+        return ""
+    main = _detect_vendor(config.models.critic)
+    # Pair each main vendor with a different reviewer. Fall back to codex.
+    pairing = {
+        "anthropic": "shell:codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -",
+        "openai": "shell:env -u ANTHROPIC_API_KEY -u CLAUDE_CODE_ENTRYPOINT -u CLAUDECODE -u ANTHROPIC_AUTH_TOKEN claude -p --dangerously-skip-permissions --allowedTools=Read,Glob,Grep,Bash --model opus",
+        "google": "shell:codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -",
+        "cursor": "shell:codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -",
+    }
+    return pairing.get(main or "", "")
+
+
+def run_stop_gate(
+    task_dir: TaskDir,
+    config: Config,
+    *,
+    judge: dict[str, Any],
+    check: CheckResult,
+) -> dict[str, Any]:
+    """Run a fresh-context blocker check before declaring stop.
+
+    Returns the (possibly amended) judge dict. If the gate finds a concrete
+    blocker, action becomes ``redo_P`` and the gate's evidence/fix is
+    appended to the hint. If the gate errors or returns invalid JSON, the
+    judge is returned unchanged (fail-open — don't block the loop on a
+    transient gate failure).
+    """
+    if not config.stop_gate.enabled:
+        return judge
+    if str(judge.get("action", "")) != "stop":
+        return judge
+    model_spec = resolve_stop_gate_model(config)
+    if not model_spec:
+        task_dir.append_log(
+            "stop_gate_skipped",
+            reason="no model resolved (auto disabled and no explicit model)",
+        )
+        return judge
+
+    workspace = task_dir.workspace_path()
+    plan = task_dir.read_text("plan.md", "(no plan)")
+    state = task_dir.load_state()
+    pre_sha = state.get("last_pre_cycle_sha")
+    if pre_sha and git_ops.is_repo(workspace):
+        git_diff = git_ops.diff_text(workspace, since=pre_sha)
+    else:
+        git_diff = "(no diff available)"
+    prompt = STOP_GATE_PROMPT.format(
+        task=task_dir.task_path().read_text(encoding="utf-8"),
+        plan=plan,
+        check=json.dumps(check.as_dict(), indent=2),
+        git_diff=git_diff or "(empty diff)",
+    )
+
+    pre_gate_sha = git_ops.current_sha(workspace) if git_ops.is_repo(workspace) else None
+    cycle = int(state.get("cycle", 0))
+    try:
+        resp = call_model(
+            "stop_gate",
+            prompt,
+            model_spec,
+            workspace=workspace,
+            timeout_s=config.model_timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001
+        task_dir.append_log(
+            "stop_gate_error", cycle=cycle, reason=str(exc)[:200],
+        )
+        return judge
+
+    # Stop-Gate is read-only — revert any writes.
+    if git_ops.is_repo(workspace) and pre_gate_sha and git_ops.has_uncommitted_changes(workspace):
+        task_dir.append_log("stop_gate_write_blocked", cycle=cycle)
+        git_ops.reset_hard(workspace, pre_gate_sha)
+
+    try:
+        parsed = extract_json(resp.text)
+    except ValueError:
+        task_dir.append_log("stop_gate_invalid_json", cycle=cycle, text=resp.text[:300])
+        return judge
+
+    blocker = bool(parsed.get("blocker", False))
+    evidence = str(parsed.get("evidence") or "")[:300]
+    minimal_fix = str(parsed.get("minimal_fix") or "")[:300]
+    task_dir.append_log(
+        "stop_gate",
+        cycle=cycle,
+        model=model_spec,
+        blocker=blocker,
+        evidence=evidence,
+        minimal_fix=minimal_fix,
+    )
+    if not blocker:
+        return judge
+    amended = dict(judge)
+    amended["passed"] = False
+    amended["action"] = "redo_P"
+    amended["better"] = False
+    hint = str(amended.get("hint") or "").rstrip()
+    addon = f"[STOP_GATE blocker] {evidence} | fix: {minimal_fix}"
+    amended["hint"] = (hint + " " + addon).strip() if hint else addon
+    return amended
 
 
 def _rule_judge(check: CheckResult) -> dict[str, Any]:

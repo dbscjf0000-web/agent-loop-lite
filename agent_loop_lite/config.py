@@ -21,6 +21,25 @@ class VerifyConfig:
 
 
 @dataclass(frozen=True)
+class StopGateConfig:
+    """v2.3: Optional second-opinion check before the loop declares stop.
+
+    When ``enabled`` is true, a fresh-context blocker check runs after the
+    main Critic returns ``action == "stop"``. If the gate finds a concrete
+    submission blocker, the loop converts the stop into a ``redo_P`` and
+    appends the gate's evidence to the judge hint.
+
+    ``model`` takes priority over ``auto``. When both are empty and
+    ``auto`` is true, the loop picks a vendor different from the main
+    Critic (claude → codex, codex → claude, gemini → codex, …).
+    """
+
+    enabled: bool = False
+    model: str = ""
+    auto: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     root: Path = Path(".agent_loop")
     max_cycles: int = 3
@@ -28,6 +47,7 @@ class Config:
     model_timeout_s: int = 600
     models: Models = field(default_factory=Models)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
+    stop_gate: StopGateConfig = field(default_factory=StopGateConfig)
 
     def with_overrides(
         self,
@@ -40,6 +60,8 @@ class Config:
         critic_model: str | None = None,
         verify_mode: str | None = None,
         verify_command: str | None = None,
+        stop_gate_model: str | None = None,
+        stop_gate_disable: bool = False,
     ) -> "Config":
         models = self.models
         if planner_model is not None:
@@ -55,6 +77,12 @@ class Config:
         if verify_command is not None:
             verify = replace(verify, command=verify_command)
 
+        stop_gate = self.stop_gate
+        if stop_gate_model is not None:
+            stop_gate = replace(stop_gate, enabled=True, model=stop_gate_model)
+        if stop_gate_disable:
+            stop_gate = replace(stop_gate, enabled=False)
+
         return replace(
             self,
             root=root or self.root,
@@ -62,6 +90,7 @@ class Config:
             max_redo=max_redo if max_redo is not None else self.max_redo,
             models=models,
             verify=verify,
+            stop_gate=stop_gate,
         )
 
 
@@ -75,6 +104,7 @@ def load_config(path: Path | None = None) -> Config:
     data = _read_toml(path)
     models = data.get("models") or {}
     verify = data.get("verify") or {}
+    stop_gate = data.get("stop_gate") or {}
     return Config(
         root=Path(str(data.get("root", ".agent_loop"))),
         max_cycles=int(data.get("max_cycles", 3)),
@@ -89,6 +119,11 @@ def load_config(path: Path | None = None) -> Config:
             mode=str(verify.get("mode", "plan")),
             command=str(verify.get("command", "")),
             timeout_s=int(verify.get("timeout_s", 30)),
+        ),
+        stop_gate=StopGateConfig(
+            enabled=bool(stop_gate.get("enabled", False)),
+            model=str(stop_gate.get("model", "")),
+            auto=bool(stop_gate.get("auto", True)),
         ),
     )
 

@@ -7,7 +7,13 @@ from typing import Any
 from agent_loop_lite import git_ops
 from agent_loop_lite.config import Config
 from agent_loop_lite.model import ModelResponse
-from agent_loop_lite.phases import parse_stages, run_builder, run_critic, run_planner
+from agent_loop_lite.phases import (
+    parse_stages,
+    run_builder,
+    run_critic,
+    run_planner,
+    run_stop_gate,
+)
 from agent_loop_lite.state import TaskDir
 
 _HISTORY_MAX = 8
@@ -116,8 +122,18 @@ class LoopRunner:
                 self.task_dir.checkpoint(cycle, "V", {"check": critic.check.as_dict()})
                 if critic.response is not None:
                     self._metric("critic", "V/J", cycle, critic.response)
-                self.task_dir.checkpoint(cycle, "J", {"judge": critic.judge})
-                state, status = self._handle_judge(state, cycle, critic.judge)
+                # v2.3: Stop-Gate second-opinion when main Critic says "stop".
+                judge = run_stop_gate(
+                    self.task_dir,
+                    self.config,
+                    judge=critic.judge,
+                    check=critic.check,
+                )
+                # Persist the final (possibly amended) judge so judge.json
+                # matches what handle_judge actually sees.
+                self.task_dir.write_json("judge.json", judge)
+                self.task_dir.checkpoint(cycle, "J", {"judge": judge})
+                state, status = self._handle_judge(state, cycle, judge)
                 if status != "running":
                     break
                 cycle = int(state["cycle"])

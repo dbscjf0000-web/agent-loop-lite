@@ -165,7 +165,72 @@ critic = "rule"
 mode = "plan"      # plan | none | pytest | shell
 command = ""       # used when mode = shell
 timeout_s = 30
+
+[stop_gate]       # v2.3 — optional second-opinion before final stop
+enabled = false   # off by default
+model = ""        # explicit model spec; empty → use `auto`
+auto = true       # pick a vendor different from `models.critic`
 ```
+
+## Stop-Gate (v2.3)
+
+After the main Critic returns ``action == "stop"``, the loop optionally
+calls a *fresh-context* reviewer to look for one concrete submission
+blocker. This is the cross-vendor pattern that caught a corrupted
+reference list during the NMI manuscript runs (codex flagged it; the
+main claude Critic and a gemini second opinion both missed it).
+
+The gate is intentionally narrow:
+
+```text
+fresh prompt:  task.md + final plan.md + check.json + git diff
+                ← no history, no previous hint, no cycle log
+output:        { blocker: bool, evidence: "…", minimal_fix: "…" }
+```
+
+- ``blocker == true`` → the final judge is amended to ``redo_P`` and
+  the gate's evidence + fix are appended to the hint.
+- ``blocker == false`` → the stop stands; the gate event is logged.
+- gate errors or invalid JSON → fail-open (the loop never breaks on a
+  flaky reviewer); a ``stop_gate_error`` / ``stop_gate_invalid_json``
+  event is logged for inspection.
+
+### Configuration priority
+
+```text
+1. CLI:     --stop-gate-model "shell:…"   (or --no-stop-gate to disable)
+2. TOML:    [stop_gate].model = "…"
+3. Auto:    pick a different vendor from models.critic
+            (claude ↔ codex, codex → claude, gemini → codex)
+4. Default: disabled
+```
+
+Auto vendor selection inspects ``models.critic`` for the keywords
+``claude`` / ``codex`` / ``gemini`` / ``cursor`` and routes to a
+different vendor's CLI by default. Override via TOML or CLI any time:
+
+```bash
+# explicit override for one run
+agent-lite run "…" --stop-gate-model "shell:gemini -p"
+
+# disable for one run even if config enables it
+agent-lite run "…" --no-stop-gate
+```
+
+```toml
+# always-on with explicit model
+[stop_gate]
+enabled = true
+model = "shell:codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -"
+
+# always-on with auto vendor pick
+[stop_gate]
+enabled = true
+auto = true
+```
+
+The Stop-Gate is read-only — any file it writes to workspace is reverted
+via ``git reset --hard`` (same enforcement as the main Critic tier).
 
 ## Verification contract
 
