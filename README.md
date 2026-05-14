@@ -273,6 +273,41 @@ PASS-only promotion (v2 policy): a failing cycle is never tagged "best."
 This is intentionally simpler than v1's `better=true` heuristic; the cost
 of a rare "fail-but-improving" case is small compared to the bookkeeping.
 
+### redo_count = consecutive-same-hint streak (v2.6)
+
+`max_redo` does **not** count every failed cycle. It counts how many
+times the same judge hint repeats in a row:
+
+```text
+cycle 1 fails with hint A → redo_count = 1
+cycle 2 fails with hint B → redo_count = 1  (reset — different blocker)
+cycle 3 fails with hint B → redo_count = 2  (streak — same blocker)
+```
+
+This was added after a polish run where Stop-Gate caught a *different*
+blocker every cycle (real progress) yet the raw-count budget cut the
+loop off. Same-hint streak preserves the "stuck on the same failure"
+safety net while letting incremental progress proceed up to
+`max_cycles`.
+
+## Builder prompt: plan is master, hint is supplementary (v2.5)
+
+A polish run can produce a substantive plan with many enumerated fixes
+yet have the Builder only touch the one item highlighted in the prior
+judge hint — LLM attention defaults to the most concrete, most recent
+signal. The Builder prompt now declares:
+
+- The **Plan** is the complete spec; address every numbered/bulleted
+  item under "Mandatory Fixes" / "Implementation Steps".
+- The prior judge **hint** is evidence of insufficient coverage, NOT
+  a smaller assignment. Past failures don't shrink the to-do list.
+- Mentally checklist the plan before declaring done; items the hint
+  didn't mention still need to be handled now.
+
+Prompt-only intervention. If Builder still narrows in real runs, the
+next step would be to teach Builder to self-run `verify.sh`, but that
+mixes the I and V phases and is held back for now.
+
 ## Staged Builder (optional)
 
 For large outputs (~5,000+ words or many independent files), the Planner
