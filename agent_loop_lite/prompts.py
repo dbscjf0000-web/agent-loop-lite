@@ -107,6 +107,20 @@ CRITICAL — never emit placeholders:
 - No "...elided...", "...(이하 동일)...", "<keep previous>", or partial
   content. Either emit the full file or do not emit that file block.
 
+PLAN IS MASTER, HINT IS SUPPLEMENTARY:
+- Treat the **Plan** below as the complete spec of every change required
+  this cycle. If the Plan enumerates N items, address ALL N — not just
+  the items called out in the prior judge hint.
+- The Previous-cycles history and Prior judge feedback are NOT a
+  scoped-down task. They highlight ONE failure caught externally; many
+  other items in the Plan may still be undone.
+- Before declaring done, mentally checklist every numbered or bulleted
+  item in the Plan's "Mandatory Fixes" / "Implementation Steps" /
+  "Files to Create or Modify". Items not yet handled this cycle MUST
+  still be handled now.
+- Do NOT narrow your work to "what the hint mentioned." Past failure
+  hints are evidence of insufficient coverage, not a smaller assignment.
+
 If a subtask context is given, focus only on that subtask.
 
 Task:
