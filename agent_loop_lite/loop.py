@@ -202,10 +202,15 @@ class LoopRunner:
         workspace = self.task_dir.workspace_path()
         passed = bool(judge.get("passed", False))
         action = str(judge.get("action", "stop"))
+        # v2.6: redo_count tracks CONSECUTIVE-same-hint streaks. Resets when
+        # the judge hint differs from the prior cycle's hint. Rationale: when
+        # Stop-Gate keeps finding *different* blockers each cycle, the loop is
+        # making real progress and shouldn't be cut off; only repeated same-
+        # hint failures indicate the loop is stuck.
         redo_count = int(state.get("redo_count", 0))
+        new_hint = str(judge.get("hint") or "")[:300]
+        prev_hint = str(state.get("previous_hint") or "")
 
-        # Capability tier 단순화: PASS만 promote (코덱스 권고).
-        # FAIL은 무조건 best-cycle-(N-1)로 리셋.
         if passed:
             tag_name = f"best-cycle-{cycle:03d}"
             git_ops.tag(workspace, tag_name)
@@ -220,13 +225,20 @@ class LoopRunner:
                 restored = True
             except Exception:
                 restored = False
-            redo_count += 1
+            # Same hint as prior cycle → increment streak; different → reset to 1.
+            if new_hint and new_hint == prev_hint:
+                redo_count += 1
+                hint_streak = "same"
+            else:
+                redo_count = 1
+                hint_streak = "new"
             self.task_dir.append_log(
                 "rollback",
                 cycle=cycle,
                 action=action,
                 restored=restored,
                 target=best_tag,
+                hint_streak=hint_streak,
             )
 
         self._append_history(state, {
