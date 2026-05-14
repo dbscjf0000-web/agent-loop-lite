@@ -290,6 +290,39 @@ loop off. Same-hint streak preserves the "stuck on the same failure"
 safety net while letting incremental progress proceed up to
 `max_cycles`.
 
+## Worker-crash handling (v2.7)
+
+Every worker (Planner / Builder / Critic) is a separate CLI subprocess.
+A subprocess can:
+
+- time out (subprocess.run hits ``model_timeout_s``)
+- exit non-zero (CLI auth error, rate limit, internal bug)
+- hang and leave orphan child processes
+
+Before v2.7 these failures raised an exception that propagated up
+through ``run_*`` into ``LoopRunner.run()``, killing the whole
+agent-lite process and leaving ``state.json`` frozen at the dead
+phase with no clean status.
+
+v2.7 wraps each worker call in ``_safe_call``:
+
+```text
+worker call OK  → continue
+worker call raises → log "worker_error" event with reason
+                     state.status = "worker_error"
+                     loop breaks, RunResult returned cleanly
+```
+
+Choice: a crashed worker **stops** the loop rather than advancing.
+Continuing with a half-written plan / build / judgment would feed
+inconsistent state to the next phase. Run ``agent-lite resume
+<task-id>`` once the underlying CLI is healthy — the loop picks up
+at the saved ``next_phase``.
+
+Stop-Gate already had its own fail-open path (errors are logged as
+``stop_gate_error`` and the gate is treated as "no blocker"); v2.7
+brings the other three workers in line.
+
 ## Builder prompt: plan is master, hint is supplementary (v2.5)
 
 A polish run can produce a substantive plan with many enumerated fixes
