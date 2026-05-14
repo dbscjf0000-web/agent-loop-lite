@@ -67,7 +67,10 @@ class LoopRunner:
                 state["last_pre_cycle_sha"] = pre_sha
                 self.task_dir.save_state(state)
 
-                planner = run_planner(self.task_dir, self.config)
+                planner = self._safe_call("planner", state, cycle, run_planner, self.task_dir, self.config)
+                if planner is None:
+                    status = "worker_error"
+                    break
                 if next_phase == "R":
                     self._checkpoint("R", cycle, planner.response)
                 self._checkpoint("P", cycle, planner.response)
@@ -86,6 +89,7 @@ class LoopRunner:
                             "stage_start", cycle=cycle, stage=stage_idx, subtasks=len(subtasks),
                         )
                         workers = min(max(1, len(subtasks)), _MAX_BUILDER_WORKERS)
+                        stage_failed = False
                         with ThreadPoolExecutor(max_workers=workers) as ex:
                             futures = [
                                 ex.submit(run_builder, self.task_dir, self.config,
@@ -93,10 +97,24 @@ class LoopRunner:
                                 for s in subtasks
                             ]
                             for fut in futures:
-                                out = fut.result()
+                                try:
+                                    out = fut.result()
+                                except Exception as exc:  # noqa: BLE001
+                                    self.task_dir.append_log(
+                                        "worker_error", worker="builder",
+                                        cycle=cycle, stage=stage_idx,
+                                        reason=str(exc)[:200],
+                                    )
+                                    stage_failed = True
+                                    continue
                                 all_changed.extend(out.changed_files)
                                 last_resp = out.response
                         self.task_dir.append_log("stage_end", cycle=cycle, stage=stage_idx)
+                        if stage_failed:
+                            status = "worker_error"
+                            break
+                    if status == "worker_error":
+                        break
                     if last_resp is not None:
                         self._checkpoint(
                             "I", cycle, last_resp,
@@ -104,7 +122,12 @@ class LoopRunner:
                              "stages": len(stages)},
                         )
                 else:
-                    builder = run_builder(self.task_dir, self.config)
+                    builder = self._safe_call(
+                        "builder", state, cycle, run_builder, self.task_dir, self.config,
+                    )
+                    if builder is None:
+                        status = "worker_error"
+                        break
                     self._checkpoint(
                         "I", cycle, builder.response,
                         {"changed_files": builder.changed_files},
@@ -118,7 +141,10 @@ class LoopRunner:
                 next_phase = "V"
 
             if next_phase in {"V", "J"}:
-                critic = run_critic(self.task_dir, self.config)
+                critic = self._safe_call("critic", state, cycle, run_critic, self.task_dir, self.config)
+                if critic is None:
+                    status = "worker_error"
+                    break
                 self.task_dir.checkpoint(cycle, "V", {"check": critic.check.as_dict()})
                 if critic.response is not None:
                     self._metric("critic", "V/J", cycle, critic.response)
@@ -152,6 +178,34 @@ class LoopRunner:
             cycles_run=int(state.get("cycle", cycle)),
             best_exists=bool(state.get("best_tag") and state["best_tag"] != "best-cycle-0"),
         )
+
+    def _safe_call(
+        self,
+        worker: str,
+        state: dict[str, Any],
+        cycle: int,
+        fn: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a worker call, logging+graceful-exit on any exception.
+
+        Returns the worker output on success or ``None`` on failure. On
+        failure, state is marked ``worker_error`` and saved so the loop
+        can be resumed cleanly.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            self.task_dir.append_log(
+                "worker_error",
+                worker=worker,
+                cycle=cycle,
+                reason=str(exc)[:300],
+            )
+            updated = {**state, "status": "worker_error"}
+            self.task_dir.save_state(updated)
+            return None
 
     def _checkpoint(
         self,
