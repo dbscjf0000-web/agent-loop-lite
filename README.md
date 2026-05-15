@@ -290,6 +290,55 @@ loop off. Same-hint streak preserves the "stuck on the same failure"
 safety net while letting incremental progress proceed up to
 `max_cycles`.
 
+## SafeRunner — robust subprocess invocation (v2.8)
+
+Three distinct CLI-integration failures showed up in real polish runs:
+
+| symptom | cause |
+|---|---|
+| ``UnicodeDecodeError`` mid-cycle | CLI emitted raw bytes for non-ASCII workspace paths; ``text=True`` couldn't recover |
+| orphan grand-children alive for hours | the immediate child was a shell; killing it left cursor's internal tools running |
+| no way to tell "hung" from "still computing" | only a single wall-clock timeout existed |
+
+``agent_loop_lite/safe_runner.py`` replaces the two duplicated
+``subprocess.run`` sites with one function:
+
+```python
+outcome = safe_runner.run(
+    command,
+    cwd=workspace,
+    stdin_bytes=prompt.encode("utf-8", errors="replace"),
+    hard_timeout_s=1800,    # absolute wall-clock budget
+    idle_timeout_s=None,    # optional: kill after N seconds of stdout silence
+)
+# outcome.returncode / .stdout / .stderr / .elapsed_s / .killed_by / .pid / .pgid
+```
+
+What it actually does:
+
+- ``subprocess.Popen`` with ``start_new_session=True`` so the child runs
+  in its own process group. On timeout the whole group is torn down
+  via ``os.killpg`` (SIGTERM, SIGKILL after a 5-second grace period) —
+  no more orphans.
+- stdout / stderr are read as **bytes** in background threads and
+  decoded with ``errors="replace"`` once the process exits. Invalid
+  bytes become ``U+FFFD`` instead of raising.
+- ``last_activity`` is refreshed every time a reader thread sees a
+  chunk, so ``idle_timeout_s`` only fires when the child is genuinely
+  silent. Set it conservatively (e.g. 600s) — CLIs that compute
+  silently for minutes are still tolerated, but a real hang is caught
+  long before the hard budget runs out.
+
+``model.py`` and ``verifier.py`` both delegate to SafeRunner, so the
+worker and verify pathways no longer drift apart in their failure
+semantics. macOS's ``EPERM``-instead-of-``ESRCH`` quirk on reaped
+process groups is handled in ``_kill_group``.
+
+Heaviness check: the module is ~140 lines with zero non-stdlib
+imports, and it lets the two call sites drop ~10 lines of bespoke
+``try/except subprocess.TimeoutExpired`` plumbing each. Net repo size
+grows but call-site complexity shrinks.
+
 ## Worker-crash handling (v2.7)
 
 Every worker (Planner / Builder / Critic) is a separate CLI subprocess.
