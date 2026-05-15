@@ -290,6 +290,35 @@ loop off. Same-hint streak preserves the "stuck on the same failure"
 safety net while letting incremental progress proceed up to
 `max_cycles`.
 
+## verify.sh coverage validator (v2.9)
+
+The Planner sometimes ships a verify.sh that silently drops mechanical
+checks the task spelled out. In the v28b polish run, three task items
+— Abstract 100–150 words, Methods `### a)` flatten, `## Supplementary
+Information inventory` removal — never appeared in verify.sh, so neither
+Critic nor Stop-Gate caught them and the loop hit `max_cycles` with
+those gaps still open.
+
+Two layers address this:
+
+1. **PLANNER_PROMPT** explicitly tells the Planner to translate every
+   mechanical check enumerated in the task 1:1 into verify.sh — no
+   silent "minor" skips.
+2. **`validate_verify_coverage(task, verify)`** runs after each Planner
+   call. A short heuristic map of nine common NMI/Article checks
+   (abstract length, no Introduction heading, Discussion subheadings,
+   Methods `### a)` flatten, SI inventory removal, Extended Data ≤10,
+   Figure Legends section, superscript citations, reference 25/26/30/37
+   anchors) flags items the task mentions but verify.sh does not.
+
+On a gap the Planner runs once more with a complaint listing the
+missing items; persistent gaps surface as `verify_coverage_gap` events
+(``attempt=1``, ``attempt=2``).
+
+Heuristic on purpose — the map is one short list users can extend per
+project, and the loop doesn't gold-plate task parsing. Mirrors the
+v2.1 plan-schema validator pattern, applied to a different deliverable.
+
 ## SafeRunner — robust subprocess invocation (v2.8)
 
 Three distinct CLI-integration failures showed up in real polish runs:
