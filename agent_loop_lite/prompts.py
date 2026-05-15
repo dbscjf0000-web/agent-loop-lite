@@ -21,6 +21,14 @@ file changed):
    • Use a real script. Do NOT inline heredocs in plan.md.
    • Cover every Success Criterion that can be checked mechanically.
    • Keep it short, deterministic, and re-runnable.
+   • **Translate every mechanical check enumerated in the task 1:1 into
+     verify.sh.** If the task says "Abstract 100–150 words" you must
+     emit a word-count check. If it says "no `## Introduction` heading"
+     you must grep for it. Do NOT silently downgrade or skip an item as
+     "minor"; if you cannot mechanically check it, write a `grep`/`awk`
+     that approximates it and add a one-line comment in verify.sh. The
+     loop runs a coverage validator that retries you when it spots gaps
+     between the task's numbered checks and your script.
 
 plan.md MUST have exactly these sections:
 

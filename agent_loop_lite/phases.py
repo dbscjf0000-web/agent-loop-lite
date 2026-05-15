@@ -69,6 +69,57 @@ def _state_context(task_dir: TaskDir) -> dict[str, str]:
 
 _PLAN_SCHEMA_REQUIRED = ("Task Summary", "Success Criteria", "Implementation Steps")
 _CHECKBOX_RE = re.compile(r"^\s*-\s*\[\s?\]", re.MULTILINE)
+
+# v2.9: task-keyword → verify.sh pattern map. If the task mentions the
+# left key, verify.sh must mention something matching the right pattern.
+# Heuristic, intentionally short — gold-plating defeats lite.
+_VERIFY_COVERAGE_RULES: list[tuple[str, str, str]] = [
+    # (label, task_keyword_regex, verify_pattern_regex)
+    ("abstract word count",
+     r"abstract.{0,60}(100[-–]\s?150|word\s*count)|150\s*word",
+     r"abstract|wc\s*-w|150"),
+    ("no Introduction heading",
+     r"no\s*##\s*introduction|##\s*introduction.*heading",
+     r"introduction|## Introduction"),
+    ("Discussion no subheading",
+     r"discussion.{0,40}(no\s*subhead|without subhead|flatten)",
+     r"discussion.*###|###\s+(scope|natural|implication)"),
+    ("Methods subheading flatten",
+     r"methods.{0,40}(###\s*[a-z]\)|subhead|flatten)|###\s*[a-z]\)",
+     r"###|subhead|methods\.md"),
+    ("Supplementary Information inventory remove",
+     r"supplementary information inventory",
+     r"Supplementary Information"),
+    ("Extended Data limit 10",
+     r"extended data.{0,30}(≤|<=|10|ten)",
+     r"Extended Data|ED Fig|extended_data"),
+    ("Figure Legends section",
+     r"figure legends.{0,30}(section|before references|add)",
+     r"Figure Legends"),
+    ("superscript citation",
+     r"superscript|<sup>|\[\d+(-\d+)?\]\s*→",
+     r"<sup>|sup>"),
+    ("reference 25 26 30 37 anchors",
+     r"reference\s*25|25,\s*26,\s*30,\s*and\s*37|corrupt.*reference",
+     r"\b25\b|\b26\b|\b30\b|\b37\b"),
+]
+
+
+def validate_verify_coverage(task_text: str, verify_sh_text: str) -> list[str]:
+    """Return labels of task-mandated mechanical checks missing from verify.sh.
+
+    Heuristic: for each rule, if the task contains the left pattern, the
+    verify.sh must contain something matching the right pattern. Missing
+    items are returned as human-readable labels.
+    """
+    if not task_text or not verify_sh_text:
+        return []
+    missing: list[str] = []
+    for label, task_re, verify_re in _VERIFY_COVERAGE_RULES:
+        if re.search(task_re, task_text, re.IGNORECASE):
+            if not re.search(verify_re, verify_sh_text, re.IGNORECASE):
+                missing.append(label)
+    return missing
 # v2.2: files Planner is allowed to add or modify in workspace/. Anything
 # else found in `git status --porcelain` after a Planner call is reverted
 # (overstepping the read-only tier). plan.md / r.md are lifted to state/
@@ -245,6 +296,31 @@ def run_planner(task_dir: TaskDir, config: Config) -> PlannerOutput:
                 cycle=int(task_dir.load_state().get("cycle", 0)),
                 issues=issues2,
                 attempt=2,
+            )
+
+    # v2.9: verify.sh coverage — task may enumerate mechanical checks the
+    # Planner silently dropped from verify.sh. Detect gaps and retry once.
+    task_text = task_dir.task_path().read_text(encoding="utf-8")
+    verify_sh_path = workspace / "verify.sh"
+    verify_text = verify_sh_path.read_text(encoding="utf-8") if verify_sh_path.exists() else ""
+    coverage_gaps = validate_verify_coverage(task_text, verify_text)
+    if coverage_gaps:
+        task_dir.append_log(
+            "verify_coverage_gap", cycle=cycle, missing=coverage_gaps, attempt=1,
+        )
+        complaint = (
+            "Your verify.sh skipped mechanical checks the task explicitly mandates:\n"
+            + "\n".join(f"- {x}" for x in coverage_gaps)
+            + "\n\nRewrite verify.sh so every one of those items has a `grep`/`awk`/"
+            "`wc` style mechanical assertion that fails when the check fails. Do "
+            "not silently downgrade any check as 'minor'."
+        )
+        resp, plan_text = _call_planner_once(task_dir, config, extra_feedback=complaint)
+        verify_text = verify_sh_path.read_text(encoding="utf-8") if verify_sh_path.exists() else ""
+        gaps2 = validate_verify_coverage(task_text, verify_text)
+        if gaps2:
+            task_dir.append_log(
+                "verify_coverage_gap", cycle=cycle, missing=gaps2, attempt=2,
             )
 
     r_notes, plan = _split_planner_response(plan_text)
