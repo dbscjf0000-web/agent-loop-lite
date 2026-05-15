@@ -91,20 +91,28 @@ def _rule_response() -> str:
 
 
 def _call_shell(command: str, prompt: str, workspace: Path, timeout_s: int) -> str:
-    proc = subprocess.run(
+    # v2.8: delegate to SafeRunner — new process group, bytes capture with
+    # errors='replace', killpg on timeout. Centralised so the verifier and
+    # model paths can't drift apart.
+    from agent_loop_lite import safe_runner
+
+    outcome = safe_runner.run(
         command,
-        input=prompt,
         cwd=workspace,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-        check=False,
+        stdin_bytes=prompt.encode("utf-8", errors="replace"),
+        hard_timeout_s=float(timeout_s),
     )
-    if proc.returncode != 0:
-        tail = (proc.stderr or "").strip()[-2000:]
-        raise RuntimeError(f"shell model failed rc={proc.returncode}: {tail}")
-    return proc.stdout.rstrip("\n")
+    if outcome.killed_by:
+        raise RuntimeError(
+            f"shell model {outcome.killed_by} after {outcome.elapsed_s}s "
+            f"(pid={outcome.pid}, pgid={outcome.pgid})"
+        )
+    if outcome.returncode != 0:
+        tail = outcome.stderr.strip()[-2000:]
+        raise RuntimeError(
+            f"shell model failed rc={outcome.returncode}: {tail}"
+        )
+    return outcome.stdout.rstrip("\n")
 
 
 def _call_litellm(model: str, prompt: str) -> str:

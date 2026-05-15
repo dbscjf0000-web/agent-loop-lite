@@ -137,27 +137,27 @@ def _run_commands(
 
 
 def _run_command(workspace: Path, command: str, timeout_s: int) -> dict[str, object]:
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=workspace,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
+    # v2.8: SafeRunner — new process group, bytes capture, killpg on
+    # timeout. Mirrors model.py's path so verify and model invocations
+    # cannot drift in their failure semantics.
+    from agent_loop_lite import safe_runner
+
+    outcome = safe_runner.run(
+        command,
+        cwd=workspace,
+        hard_timeout_s=float(timeout_s),
+    )
+    if outcome.killed_by:
         return {
             "command": command,
             "returncode": 124,
-            "stdout": exc.stdout or "",
-            "stderr": exc.stderr or f"timed out after {timeout_s}s",
+            "stdout": outcome.stdout[-4000:],
+            "stderr": (outcome.stderr + f"\n[{outcome.killed_by} after {outcome.elapsed_s}s]")[-4000:],
         }
 
     return {
         "command": command,
-        "returncode": proc.returncode,
-        "stdout": (proc.stdout or "")[-4000:],
-        "stderr": (proc.stderr or "")[-4000:],
+        "returncode": outcome.returncode,
+        "stdout": outcome.stdout[-4000:],
+        "stderr": outcome.stderr[-4000:],
     }
