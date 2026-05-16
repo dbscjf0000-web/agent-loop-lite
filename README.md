@@ -290,6 +290,38 @@ loop off. Same-hint streak preserves the "stuck on the same failure"
 safety net while letting incremental progress proceed up to
 `max_cycles`.
 
+## FAIL-but-better promotion (v2.10)
+
+The v2 "PASS-only promote" simplification cost the loop its ability to
+converge when no single cycle is good enough to PASS. In the NMI
+manuscript polish runs (v29 / v29x) the Critic caught a different
+concrete issue every cycle while the Builder made real progress, yet
+every FAIL rolled back to ``best-cycle-0`` — accumulated fixes
+vanished each iteration and the loop hit ``max_cycles`` having
+effectively done nothing.
+
+v2.10 brings back v1's three-way decision, judged on the Critic's
+``better`` field:
+
+```text
+passed = true              → promote_best   (tag "best-cycle-N")
+passed = false, better = true   → promote_better (tag "better-cycle-N")
+passed = false, better = false  → rollback to prior best
+```
+
+``state.best_tag`` advances on either promote, so the next cycle starts
+from the latest accepted snapshot. The hint still flows through to
+drive the next plan. Stop-Gate's amended judge sets ``better: false``,
+so a Stop-Gate-triggered redo continues to roll back as before.
+
+The Critic prompt now explicitly tells the model: set ``better: true``
+when the cycle measurably advances the work even if it didn't PASS;
+set ``better: false`` when the cycle regressed or did not net-improve.
+
+This restores the v1 convergence behaviour without bringing back the
+``better`` heuristic mess — it's a single ``state["best_tag"]``
+update plus a new ``promote_better`` log event.
+
 ## verify.sh coverage validator (v2.9)
 
 The Planner sometimes ships a verify.sh that silently drops mechanical
