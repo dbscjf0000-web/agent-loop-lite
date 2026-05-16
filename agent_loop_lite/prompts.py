@@ -232,6 +232,14 @@ Return JSON only — emit the JSON object as your text response. No fences.
   "reason": "<short reason>"
 }}
 
+The ``better`` field matters even when ``passed`` is false. Set
+``better: true`` when this cycle's diff measurably advances the work
+versus the prior best (e.g. fixes some mandatory items even if others
+remain), so the loop can promote the partial progress and continue
+from here next cycle. Set ``better: false`` when the cycle either
+regressed or did not net-improve — that triggers rollback to the
+previous best.
+
 When action != "stop", hint must include:
 - what failed
 - likely cause

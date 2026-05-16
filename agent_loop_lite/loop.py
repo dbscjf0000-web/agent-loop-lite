@@ -265,6 +265,13 @@ class LoopRunner:
         new_hint = str(judge.get("hint") or "")[:300]
         prev_hint = str(state.get("previous_hint") or "")
 
+        # v2.10: revive FAIL-but-better promotion. When the Critic reports
+        # the cycle improved over the prior best (passed=false, better=true),
+        # keep Builder's progress under a `better-cycle-N` tag instead of
+        # rolling back. This lets the loop accumulate fixes across cycles
+        # when no single cycle PASSes — the previous v2 simplification
+        # ("PASS only promote") cost us convergence on the polish task.
+        better = bool(judge.get("better", passed))
         if passed:
             tag_name = f"best-cycle-{cycle:03d}"
             git_ops.tag(workspace, tag_name)
@@ -272,6 +279,27 @@ class LoopRunner:
             state["best_exists"] = True
             redo_count = 0
             self.task_dir.append_log("promote_best", cycle=cycle, tag=tag_name)
+        elif better:
+            # FAIL but improved — promote so the next cycle starts from here,
+            # not from the prior best. The hint still flows through to drive
+            # the next plan.
+            tag_name = f"better-cycle-{cycle:03d}"
+            git_ops.tag(workspace, tag_name)
+            state["best_tag"] = tag_name
+            state["best_exists"] = True
+            if new_hint and new_hint == prev_hint:
+                redo_count += 1
+                hint_streak = "same"
+            else:
+                redo_count = 1
+                hint_streak = "new"
+            self.task_dir.append_log(
+                "promote_better",
+                cycle=cycle,
+                tag=tag_name,
+                action=action,
+                hint_streak=hint_streak,
+            )
         else:
             best_tag = str(state.get("best_tag") or "best-cycle-0")
             try:
@@ -279,7 +307,6 @@ class LoopRunner:
                 restored = True
             except Exception:
                 restored = False
-            # Same hint as prior cycle → increment streak; different → reset to 1.
             if new_hint and new_hint == prev_hint:
                 redo_count += 1
                 hint_streak = "same"
